@@ -61,6 +61,7 @@ Rules:
 - When fetching external data, if a URL/API fails, try at least one alternative approach (a different URL structure, a cached mirror, or re-reading the question for an explicit source) before giving up.
 - Never guess or hardcode a fallback answer when a fetch fails. If, after reasonable attempts, you cannot retrieve real data, say so honestly in your final answer rather than fabricating a plausible-looking one — a wrong answer that admits uncertainty is safer than a confident guess that happens to be checked against a real value.
 - Prefer data sources explicitly mentioned or linked in the question over ones you recall from training, since your training knowledge of specific APIs/endpoints may be outdated.
+- Do not guess more than 2-3 speculative URLs for a dataset. If official sources aren't immediately found, fall back to your trained knowledge sooner rather than exhausting many attempts on unlikely URLs.
 """
 
 run_python_tool = types.FunctionDeclaration(
@@ -172,6 +173,19 @@ def run_agent(history: list, chat_id: int) -> dict:
                 break
     except Exception as e:
         convo_log.append({"event": "exception", "error": str(e), "trace": traceback.format_exc()})
+
+    if response_text is None and step >= max_steps:
+        convo_log.append({"event": "max_steps_exceeded", "step": step})
+        try:
+            contents.append(types.Content(
+                role="user",
+                parts=[types.Part(text="You have used too many steps. Stop trying new approaches and answer NOW with only the final JSON object, using your best available information.")]
+            ))
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+            response_text = safe_text(response)
+            convo_log.append({"event": "forced_final_after_max_steps", "text": response_text})
+        except Exception as e:
+            convo_log.append({"event": "forced_answer_failed", "error": str(e)})
 
     for entry in convo_log:
         log_event({"chat_id": chat_id, **entry})
