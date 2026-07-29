@@ -245,7 +245,7 @@ def self_ping_loop():
 # ---------- FASTAPI APP ----------
 app = FastAPI()
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
