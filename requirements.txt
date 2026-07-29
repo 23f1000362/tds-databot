@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+requests
+google-genai
+pandas
+numpy
+beautifulsoup4
+openpyxl
+lxml
