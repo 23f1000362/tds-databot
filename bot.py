@@ -54,7 +54,8 @@ Rules:
 - For general published statistics that are stable, well-documented facts (e.g. "which state has the highest X" for a well-known metric), you may answer from your own trained knowledge if fetching genuinely fails after retrying — but only when you are reasonably confident this fact hasn't changed and isn't ambiguous, and only after real retry attempts, not as a first resort.
 - Never invent a specific number, statistic, or live value (like a current price, live measurement, or exact computed figure) — for these, if fetching fails after retries, say so explicitly rather than fabricating a number.
 - Your FINAL reply must be ONLY a single JSON object, and nothing else - no markdown fences, no prose, no "here is the answer".
-- Match the JSON shape the question asks for EXACTLY (same keys, same nesting, correct types - number vs string).
+- Match the JSON shape the question asks for EXACTLY. If the question shows an example like {"answer": <value>, "log_url": "..."}, the outer key MUST be the literal string "answer" - never substitute a more descriptive key name like "capital", "state", "total", "result", or similar, even if it feels more readable. Copy the exact key names shown in the question's example, do not invent your own.
+- If "answer" should hold a plain value (a number, a string, true/false), do NOT wrap it in a nested object - return the raw value directly as "answer"'s value, unless the question's own example explicitly shows a nested object for "answer".
 - Always include a "log_url" key in your final JSON with the exact placeholder string "LOG_URL_PLACEHOLDER" - the calling code will replace it.
 - If a message is just setup/context (e.g. "I will send data next"), still reply with a minimal valid JSON acknowledgment.
 - Never add extra keys beyond what's asked.
@@ -198,7 +199,15 @@ def run_agent(history: list, chat_id: int) -> dict:
     if parsed is None:
         parsed = {"answer": "internal error", "log_url": "LOG_URL_PLACEHOLDER"}
     elif "answer" not in parsed:
-        parsed = {"answer": parsed, "log_url": "LOG_URL_PLACEHOLDER"}
+        # Model used a wrong top-level key (e.g. "capital" instead of "answer").
+        # If there's exactly one other key besides log_url, unwrap it directly
+        # rather than nesting the whole dict under "answer".
+        other_keys = [k for k in parsed.keys() if k != "log_url"]
+        if len(other_keys) == 1:
+            value = parsed[other_keys[0]]
+            parsed = {"answer": value, "log_url": parsed.get("log_url", "LOG_URL_PLACEHOLDER")}
+        else:
+            parsed = {"answer": parsed, "log_url": "LOG_URL_PLACEHOLDER"}
 
     parsed["log_url"] = f"{BASE_URL}/run.jsonl"
     return parsed
