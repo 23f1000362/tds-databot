@@ -3,8 +3,10 @@ import json
 import time
 import threading
 import traceback
+import signal
 from datetime import datetime, timezone
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from fastapi import FastAPI
@@ -36,30 +38,44 @@ def log_event(event: dict):
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
 
+# ---------- CONCURRENCY CONTROL ----------
+# Bounded pool for handling messages. Caps how many "agent runs" can be
+# in flight at once instead of spawning an unbounded number of raw threads.
+MESSAGE_WORKERS = 4
+message_executor = ThreadPoolExecutor(max_workers=MESSAGE_WORKERS, thread_name_prefix="msg")
+
+# Separate small pool just for run_python's timeout-guarded execution.
+# Bounded so a burst of tool calls can't create unbounded native threads either.
+TOOL_WORKERS = 8
+tool_executor = ThreadPoolExecutor(max_workers=TOOL_WORKERS, thread_name_prefix="tool")
+
 # ---------- TOOL: run_python ----------
 def run_python(code: str, timeout: float = 60) -> str:
     import io
     import contextlib
-
-    result_holder = {}
 
     def _exec_target():
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
                 exec(code, {"__builtins__": __builtins__}, {})
-            result_holder["output"] = buf.getvalue()
+            return buf.getvalue()
         except Exception as e:
-            result_holder["output"] = f"ERROR: {e}\n{traceback.format_exc()}"
+            return f"ERROR: {e}\n{traceback.format_exc()}"
 
-    t = threading.Thread(target=_exec_target, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-
-    if t.is_alive():
+    future = tool_executor.submit(_exec_target)
+    try:
+        output = future.result(timeout=timeout)
+    except Exception:
+        # Covers both TimeoutError and any executor-level failure.
+        # Note: the underlying thread is NOT killed (Python has no safe way
+        # to kill a thread) - it keeps running in the background and its
+        # result is discarded. This matches the original behavior but is
+        # worth knowing: a hung exec() leaks a thread until it finishes on
+        # its own or the process restarts.
         return f"ERROR: code execution timed out after {timeout:.0f} seconds (likely a hanging network call or infinite loop)."
 
-    return result_holder.get("output", "ERROR: execution failed with no output captured.")[-8000:]
+    return output[-8000:]
 
 # ---------- SYSTEM PROMPT (shared by both providers) ----------
 SYSTEM_PROMPT = """You are a data-analyst agent replying to Telegram messages.
@@ -195,21 +211,22 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
     max_steps = 10
     step = 0
     response_text = None
-    response = None
 
     response = gemini_generate(contents)
 
+    # BUG FIX: the original checked `time.time() > deadline` at the TOP of
+    # the loop, BEFORE looking at the response that was just fetched. Since
+    # step 1's response is fetched *before* the loop even starts, and the
+    # deadline check for "step 2" ran essentially instantly afterward, a
+    # deadline that's already stale (or a slow first call) causes the
+    # very next step to immediately declare "deadline exceeded" even
+    # though a perfectly good response was sitting right there unused.
+    # This is exactly what happened in your log: it got a valid function
+    # response, then discarded it because of a deadline check with no
+    # real work in between. Fix: check the deadline based on what's left
+    # of the budget, and don't let a fast, valid response get thrown away.
     while step < max_steps:
         step += 1
-        if time.time() > deadline:
-            convo_log.append({"event": "gemini_deadline_exceeded", "step": step})
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part(text="Time is up. Answer NOW with only the final JSON object, no tools.")]
-            ))
-            response = gemini_generate(contents, max_retries=1)
-            response_text = safe_text(response)
-            break
 
         if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
             convo_log.append({
@@ -228,7 +245,21 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
             fc = func_calls[0]
             code = fc.args.get("code", "")
             convo_log.append({"event": "gemini_tool_call", "step": step, "code": code})
-            remaining = max(5, deadline - time.time())
+
+            remaining = deadline - time.time()
+            if remaining <= 5:
+                # Not enough budget left to run a tool call and still get
+                # a final answer back. Stop looping and force a final answer.
+                convo_log.append({"event": "gemini_deadline_exceeded", "step": step})
+                contents.append(candidate.content)
+                contents.append(types.Content(
+                    role="user",
+                    parts=[types.Part(text="Time is up. Answer NOW with only the final JSON object, no tools.")]
+                ))
+                response = gemini_generate(contents, max_retries=1)
+                response_text = safe_text(response)
+                break
+
             call_timeout = min(60, remaining)
             result = run_python(code, timeout=call_timeout)
             convo_log.append({"event": "gemini_tool_result", "step": step, "output": result})
@@ -240,6 +271,17 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
                     name="run_python", response={"result": result}
                 ))]
             ))
+
+            if time.time() > deadline:
+                convo_log.append({"event": "gemini_deadline_exceeded", "step": step})
+                contents.append(types.Content(
+                    role="user",
+                    parts=[types.Part(text="Time is up. Answer NOW with only the final JSON object, no tools.")]
+                ))
+                response = gemini_generate(contents, max_retries=1)
+                response_text = safe_text(response)
+                break
+
             response = gemini_generate(contents)
         else:
             response_text = safe_text(response)
@@ -359,6 +401,11 @@ def run_agent(history: list, chat_id: int) -> dict:
 
 # ---------- TELEGRAM POLLING ----------
 chat_histories = defaultdict(list)
+history_lock = threading.Lock()  # BUG FIX: chat_histories is mutated from
+                                  # multiple worker threads concurrently;
+                                  # defaultdict/list mutation isn't atomic
+                                  # across the read-modify-write sequences
+                                  # used below, so guard it.
 MAX_HISTORY = 20
 
 def telegram_send(chat_id, text):
@@ -367,18 +414,25 @@ def telegram_send(chat_id, text):
     except Exception as e:
         log_event({"chat_id": chat_id, "event": "telegram_send_failed", "error": str(e)})
 
-def handle_message(chat_id, text):
-    chat_histories[chat_id].append({"role": "user", "parts": [text]})
-    chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
+def handle_message(chat_id, text, received_at):
+    log_event({"chat_id": chat_id, "event": "handler_started", "queue_delay_sec": round(time.time() - received_at, 3)})
+
+    with history_lock:
+        chat_histories[chat_id].append({"role": "user", "parts": [text]})
+        chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
+        history_snapshot = list(chat_histories[chat_id])
 
     try:
-        result = run_agent(chat_histories[chat_id], chat_id)
+        result = run_agent(history_snapshot, chat_id)
     except Exception as e:
         log_event({"chat_id": chat_id, "event": "top_level_exception", "error": str(e), "trace": traceback.format_exc()})
         result = {"answer": "internal error", "log_url": f"{BASE_URL}/run.jsonl"}
 
     reply_text = json.dumps(result)
-    chat_histories[chat_id].append({"role": "model", "parts": [reply_text]})
+
+    with history_lock:
+        chat_histories[chat_id].append({"role": "model", "parts": [reply_text]})
+        chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
 
     telegram_send(chat_id, reply_text)
     log_event({"chat_id": chat_id, "event": "reply_sent", "reply": result})
@@ -400,7 +454,11 @@ def polling_loop():
                 chat_id = message["chat"]["id"]
                 text = message.get("text", "")
                 if text:
-                    threading.Thread(target=handle_message, args=(chat_id, text)).start()
+                    # BUG FIX: was `threading.Thread(...).start()` per message
+                    # with no cap. Now goes through a bounded pool so bursts
+                    # of messages queue instead of spawning unbounded threads
+                    # that starve each other for GIL/network time.
+                    message_executor.submit(handle_message, chat_id, text, time.time())
         except Exception as e:
             log_event({"event": "polling_error", "error": str(e)})
             time.sleep(5)
