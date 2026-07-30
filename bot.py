@@ -35,14 +35,32 @@ def log_event(event: dict):
 def run_python(code: str) -> str:
     import io
     import contextlib
+    import multiprocessing
 
-    buf = io.StringIO()
+    def _exec_target(code, queue):
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                exec(code, {"__builtins__": __builtins__}, {})
+            queue.put(buf.getvalue())
+        except Exception as e:
+            queue.put(f"ERROR: {e}\n{traceback.format_exc()}")
+
+    queue = multiprocessing.Queue()
+    p = multiprocessing.Process(target=_exec_target, args=(code, queue))
+    p.start()
+    p.join(timeout=25)  # hard cap per tool call
+
+    if p.is_alive():
+        p.terminate()
+        p.join()
+        return "ERROR: code execution timed out after 25 seconds (likely a hanging network call or infinite loop)."
+
     try:
-        with contextlib.redirect_stdout(buf):
-            exec(code, {"__builtins__": __builtins__}, {})
-        output = buf.getvalue()
-    except Exception as e:
-        output = f"ERROR: {e}\n{traceback.format_exc()}"
+        output = queue.get_nowait()
+    except Exception:
+        output = "ERROR: execution failed with no output captured."
+
     return output[-8000:]
 
 # ---------- GEMINI AGENT ----------
