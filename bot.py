@@ -5,7 +5,6 @@ import threading
 import traceback
 from datetime import datetime, timezone
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from fastapi import FastAPI
@@ -20,27 +19,19 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 BASE_URL = os.environ["BASE_URL"]
 
-# FIX: timeout cut to 12s, and retry_options attempts=1 disables the SDK's
-# own internal tenacity retry loop. Previously the SDK was silently
-# retrying transient errors internally (up to ~4x with backoff) BEFORE
-# ever raising back to gemini_generate() - that's why a "45s timeout"
-# actually took ~93s. Now one failed call fails in ~12s, period.
-client = genai.Client(
-    api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(
-        timeout=12_000,  # ms
-        retry_options=types.HttpRetryOptions(attempts=1),
-    ),
-)
+client = genai.Client(api_key=GEMINI_API_KEY)
 GEMINI_MODEL = "gemini-flash-lite-latest"
 
-groq_client = Groq(api_key=GROQ_API_KEY, timeout=20.0)
+groq_client = Groq(api_key=GROQ_API_KEY)
 GROQ_MODEL = "llama-3.3-70b-versatile"
+
+DAILY_GEMINI_LIMIT = 500
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 LOG_FILE = "run.jsonl"
 log_lock = threading.Lock()
+
 
 def log_event(event: dict):
     event["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -48,38 +39,38 @@ def log_event(event: dict):
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
 
-def log_step(chat_id, convo_log, entry):
-    convo_log.append(entry)
-    log_event({"chat_id": chat_id, **entry})
 
-# ---------- CONCURRENCY CONTROL ----------
-MESSAGE_WORKERS = 4
-message_executor = ThreadPoolExecutor(max_workers=MESSAGE_WORKERS, thread_name_prefix="msg")
+# ---------- GEMINI DAILY QUOTA ----------
+usage_lock = threading.Lock()
+usage_state = {"date": None, "count": 0}
 
-TOOL_WORKERS = 8
-tool_executor = ThreadPoolExecutor(max_workers=TOOL_WORKERS, thread_name_prefix="tool")
+
+def gemini_quota_available() -> bool:
+    today = datetime.now(timezone.utc).date().isoformat()
+    with usage_lock:
+        if usage_state["date"] != today:
+            usage_state["date"] = today
+            usage_state["count"] = 0
+        if usage_state["count"] >= DAILY_GEMINI_LIMIT:
+            return False
+        usage_state["count"] += 1
+        return True
+
 
 # ---------- TOOL: run_python ----------
-def run_python(code: str, timeout: float = 60) -> str:
+def run_python(code: str) -> str:
     import io
     import contextlib
 
-    def _exec_target():
-        buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf):
-                exec(code, {"__builtins__": __builtins__}, {})
-            return buf.getvalue()
-        except Exception as e:
-            return f"ERROR: {e}\n{traceback.format_exc()}"
-
-    future = tool_executor.submit(_exec_target)
+    buf = io.StringIO()
     try:
-        output = future.result(timeout=timeout)
-    except Exception:
-        return f"ERROR: code execution timed out after {timeout:.0f} seconds (likely a hanging network call or infinite loop)."
-
+        with contextlib.redirect_stdout(buf):
+            exec(code, {"__builtins__": __builtins__}, {})
+        output = buf.getvalue()
+    except Exception as e:
+        output = f"ERROR: {e}\n{traceback.format_exc()}"
     return output[-8000:]
+
 
 # ---------- SYSTEM PROMPT (shared by both providers) ----------
 SYSTEM_PROMPT = """You are a data-analyst agent replying to Telegram messages.
@@ -87,18 +78,21 @@ SYSTEM_PROMPT = """You are a data-analyst agent replying to Telegram messages.
 Rules:
 - Answer the LATEST message in the conversation. Earlier messages are context for multi-turn questions.
 - Use the run_python tool to fetch data and compute answers. Never guess a number you could compute.
-- For general published statistics that are stable, well-documented facts (e.g. "which state has the highest X" for a well-known metric), you may answer from your own trained knowledge if fetching genuinely fails after retrying — but only when you are reasonably confident this fact hasn't changed and isn't ambiguous, and only after real retry attempts, not as a first resort.
+- For general published facts that are genuinely static and non-time-sensitive (e.g. "what is the capital of X", "who wrote X"), you may answer from your own trained knowledge if fetching genuinely fails after retrying. Do NOT use this for statistics, rankings, or rates that are periodically updated (census data, health/economic indicators, "highest/lowest X" rankings) — these must go through the official-source rules below, since your trained knowledge of these can be stale even when you're confident.
 - Never invent a specific number, statistic, or live value (like a current price, live measurement, or exact computed figure) — for these, if fetching fails after retries, say so explicitly rather than fabricating a number.
 - Your FINAL reply must be ONLY a single JSON object, and nothing else - no markdown fences, no prose, no "here is the answer".
-- Match the JSON shape the question asks for EXACTLY. If the question shows an example like {"answer": <value>, "log_url": "..."}, the outer key MUST be the literal string "answer" - never substitute a more descriptive key name like "capital", "state", "total", "result", or similar, even if it feels more readable. Copy the exact key names shown in the question's example, do not invent your own.
-- If "answer" should hold a plain value (a number, a string, true/false), do NOT wrap it in a nested object - return the raw value directly as "answer"'s value, unless the question's own example explicitly shows a nested object for "answer".
+- Match the JSON shape the question asks for EXACTLY (same keys, same nesting, correct types - number vs string).
 - Always include a "log_url" key in your final JSON with the exact placeholder string "LOG_URL_PLACEHOLDER" - the calling code will replace it.
 - If a message is just setup/context (e.g. "I will send data next"), still reply with a minimal valid JSON acknowledgment.
 - Never add extra keys beyond what's asked.
 - When fetching external data, if a URL/API fails, try at least one alternative approach (a different URL structure, a cached mirror, or re-reading the question for an explicit source) before giving up.
 - Never guess or hardcode a fallback answer when a fetch fails. If, after reasonable attempts, you cannot retrieve real data, say so honestly in your final answer rather than fabricating a plausible-looking one — a wrong answer that admits uncertainty is safer than a confident guess that happens to be checked against a real value.
 - Prefer data sources explicitly mentioned or linked in the question over ones you recall from training, since your training knowledge of specific APIs/endpoints may be outdated.
-- Do not guess more than 2-3 speculative URLs for a dataset. If official sources aren't immediately found, fall back to your trained knowledge sooner rather than exhausting many attempts on unlikely URLs.
+- Do not guess more than 2-3 speculative URLs for a dataset. If official sources aren't findable that way, broaden to a regular web search rather than continuing to guess URLs — do not skip straight to trained knowledge for time-sensitive statistics (see rules on official sources below).
+- For official/government statistics questions (census, health ministry data, economic indicators, rankings, etc. from any country), search for the specific official source or bulletin directly (e.g. "site:gov domain name of the report") rather than broad generic keyword searches — broad searches often blend results from unrelated countries/regions or multiple time periods into one messy result set.
+- If your search results contain data from multiple time periods or reporting cycles, always use the most recently published one and explicitly discard older figures. Do not average conflicting numbers or default to an older "commonly known" ranking once you have newer data.
+- If you already have clear, recent, sourced data that contradicts a fact you'd otherwise recall from training, trust the newer sourced data over your training knowledge.
+- If after 3-4 focused search steps you still don't have one clean, single-source, unambiguous answer, say so explicitly in your final answer rather than picking one number out of a mix of conflicting snippets.
 """
 
 # ---------- GEMINI SETUP ----------
@@ -116,7 +110,7 @@ run_python_tool = types.FunctionDeclaration(
 
 gemini_tools = types.Tool(function_declarations=[run_python_tool])
 
-gemini_config = types.GenerateContentConfig(
+config = types.GenerateContentConfig(
     system_instruction=SYSTEM_PROMPT,
     tools=[gemini_tools],
 )
@@ -136,6 +130,7 @@ groq_tools = [{
         }
     }
 }]
+
 
 def extract_json(text: str):
     if not text:
@@ -166,12 +161,13 @@ def extract_json(text: str):
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                candidate = text[start:i+1]
+                candidate = text[start:i + 1]
                 try:
                     return json.loads(candidate)
                 except json.JSONDecodeError:
                     return None
     return None
+
 
 def safe_text(response):
     try:
@@ -179,34 +175,9 @@ def safe_text(response):
     except Exception:
         return None
 
-def normalize_final(parsed):
-    if parsed is None:
-        return {"answer": "internal error", "log_url": "LOG_URL_PLACEHOLDER"}
-    if "answer" not in parsed:
-        other_keys = [k for k in parsed.keys() if k != "log_url"]
-        if len(other_keys) == 1:
-            value = parsed[other_keys[0]]
-            parsed = {"answer": value, "log_url": parsed.get("log_url", "LOG_URL_PLACEHOLDER")}
-        else:
-            parsed = {"answer": parsed, "log_url": "LOG_URL_PLACEHOLDER"}
-    return parsed
-
-# FIX: max_retries dropped to 1 (i.e. one attempt, no retry, no sleep).
-# With the SDK's own internal retry now also disabled, one bad/slow
-# Gemini call now costs ~12s (the http timeout) instead of ~93s.
-def gemini_generate(contents, max_retries=1):
-    last_err = None
-    for attempt in range(max_retries):
-        try:
-            return client.models.generate_content(
-                model=GEMINI_MODEL, contents=contents, config=gemini_config
-            )
-        except Exception as e:
-            last_err = e
-    raise last_err
 
 # ---------- GEMINI AGENT LOOP ----------
-def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: list):
+def run_gemini_agent(history: list, chat_id: int, convo_log: list):
     contents = []
     for h in history:
         role = "user" if h["role"] == "user" else "model"
@@ -215,21 +186,19 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
     max_steps = 10
     step = 0
     response_text = None
+    response = None
 
-    log_step(chat_id, convo_log, {"event": "gemini_calling", "step": 0})
-    response = gemini_generate(contents)
-    log_step(chat_id, convo_log, {"event": "gemini_first_response_received", "step": 0})
+    try:
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+    except Exception as e:
+        convo_log.append({"event": "gemini_exception", "error": str(e), "trace": traceback.format_exc()})
+        return None
 
-    while step < max_steps:
+    while response is not None and step < max_steps:
         step += 1
 
         if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
-            log_step(chat_id, convo_log, {
-                "event": "gemini_empty_response",
-                "step": step,
-                "finish_reason": str(getattr(response.candidates[0], "finish_reason", None)) if response.candidates else "no_candidates"
-            })
-            response_text = None
+            convo_log.append({"event": "gemini_empty_response", "step": step})
             break
 
         candidate = response.candidates[0]
@@ -239,23 +208,10 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
         if func_calls:
             fc = func_calls[0]
             code = fc.args.get("code", "")
-            log_step(chat_id, convo_log, {"event": "gemini_tool_call", "step": step, "code": code})
+            convo_log.append({"event": "tool_call", "step": step, "code": code})
 
-            remaining = deadline - time.time()
-            if remaining <= 5:
-                log_step(chat_id, convo_log, {"event": "gemini_deadline_exceeded", "step": step})
-                contents.append(candidate.content)
-                contents.append(types.Content(
-                    role="user",
-                    parts=[types.Part(text="Time is up. Answer NOW with only the final JSON object, no tools.")]
-                ))
-                response = gemini_generate(contents)
-                response_text = safe_text(response)
-                break
-
-            call_timeout = min(60, remaining)
-            result = run_python(code, timeout=call_timeout)
-            log_step(chat_id, convo_log, {"event": "gemini_tool_result", "step": step, "output": result})
+            result = run_python(code)
+            convo_log.append({"event": "tool_result", "step": step, "output": result})
 
             contents.append(candidate.content)
             contents.append(types.Content(
@@ -265,40 +221,38 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
                 ))]
             ))
 
-            if time.time() > deadline:
-                log_step(chat_id, convo_log, {"event": "gemini_deadline_exceeded", "step": step})
-                contents.append(types.Content(
-                    role="user",
-                    parts=[types.Part(text="Time is up. Answer NOW with only the final JSON object, no tools.")]
-                ))
-                response = gemini_generate(contents)
-                response_text = safe_text(response)
+            try:
+                response = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+            except Exception as e:
+                convo_log.append({"event": "gemini_exception", "error": str(e), "trace": traceback.format_exc()})
+                response = None
                 break
-
-            log_step(chat_id, convo_log, {"event": "gemini_calling", "step": step})
-            response = gemini_generate(contents)
-            log_step(chat_id, convo_log, {"event": "gemini_response_received", "step": step})
         else:
             response_text = safe_text(response)
-            log_step(chat_id, convo_log, {"event": "gemini_final_text", "step": step, "text": response_text})
+            convo_log.append({"event": "final_text", "step": step, "text": response_text})
             break
 
     if response_text is None and step >= max_steps:
-        log_step(chat_id, convo_log, {"event": "gemini_max_steps_exceeded", "step": step})
-        contents.append(types.Content(
-            role="user",
-            parts=[types.Part(text="You have used too many steps. Stop trying new approaches and answer NOW with only the final JSON object, using your best available information.")]
-        ))
-        response = gemini_generate(contents)
-        response_text = safe_text(response)
+        convo_log.append({"event": "max_steps_exceeded", "step": step})
+        try:
+            contents.append(types.Content(
+                role="user",
+                parts=[types.Part(text="You have used too many steps. Stop trying new approaches and answer NOW with only the final JSON object, using your best available information.")]
+            ))
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+            response_text = safe_text(response)
+            convo_log.append({"event": "forced_final_after_max_steps", "text": response_text})
+        except Exception as e:
+            convo_log.append({"event": "forced_answer_failed", "error": str(e)})
 
     if response_text is None and response is not None:
         response_text = safe_text(response)
 
     return response_text
 
+
 # ---------- GROQ AGENT LOOP (fallback) ----------
-def run_groq_agent(history: list, chat_id: int, deadline: float, convo_log: list):
+def run_groq_agent(history: list, chat_id: int, convo_log: list):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in history:
         role = "user" if h["role"] == "user" else "assistant"
@@ -310,22 +264,17 @@ def run_groq_agent(history: list, chat_id: int, deadline: float, convo_log: list
 
     while step < max_steps:
         step += 1
-        if time.time() > deadline:
-            log_step(chat_id, convo_log, {"event": "groq_deadline_exceeded", "step": step})
-            messages.append({"role": "user", "content": "Time is up. Answer NOW with only the final JSON object, no tools."})
+        try:
             resp = groq_client.chat.completions.create(
-                model=GROQ_MODEL, messages=messages,
+                model=GROQ_MODEL,
+                messages=messages,
+                tools=groq_tools,
+                tool_choice="auto",
             )
-            response_text = resp.choices[0].message.content
+        except Exception as e:
+            convo_log.append({"event": "groq_exception", "error": str(e), "trace": traceback.format_exc()})
             break
 
-        log_step(chat_id, convo_log, {"event": "groq_calling", "step": step})
-        resp = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            tools=groq_tools,
-            tool_choice="auto",
-        )
         msg = resp.choices[0].message
 
         if msg.tool_calls:
@@ -340,11 +289,9 @@ def run_groq_agent(history: list, chat_id: int, deadline: float, convo_log: list
                 except Exception:
                     args = {}
                 code = args.get("code", "")
-                log_step(chat_id, convo_log, {"event": "groq_tool_call", "step": step, "code": code})
-                remaining = max(5, deadline - time.time())
-                call_timeout = min(60, remaining)
-                result = run_python(code, timeout=call_timeout)
-                log_step(chat_id, convo_log, {"event": "groq_tool_result", "step": step, "output": result})
+                convo_log.append({"event": "groq_tool_call", "step": step, "code": code})
+                result = run_python(code)
+                convo_log.append({"event": "groq_tool_result", "step": step, "output": result})
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -352,50 +299,57 @@ def run_groq_agent(history: list, chat_id: int, deadline: float, convo_log: list
                 })
         else:
             response_text = msg.content
-            log_step(chat_id, convo_log, {"event": "groq_final_text", "step": step, "text": response_text})
+            convo_log.append({"event": "groq_final_text", "step": step, "text": response_text})
             break
 
     if response_text is None:
-        log_step(chat_id, convo_log, {"event": "groq_max_steps_exceeded", "step": step})
-        messages.append({"role": "user", "content": "Stop trying new approaches and answer NOW with only the final JSON object, using your best available information."})
-        resp = groq_client.chat.completions.create(model=GROQ_MODEL, messages=messages)
-        response_text = resp.choices[0].message.content
+        convo_log.append({"event": "groq_max_steps_exceeded", "step": step})
+        try:
+            messages.append({"role": "user", "content": "Stop trying new approaches and answer NOW with only the final JSON object, using your best available information."})
+            resp = groq_client.chat.completions.create(model=GROQ_MODEL, messages=messages)
+            response_text = resp.choices[0].message.content
+            convo_log.append({"event": "groq_forced_final", "text": response_text})
+        except Exception as e:
+            convo_log.append({"event": "groq_forced_answer_failed", "error": str(e)})
 
     return response_text
 
+
 # ---------- ORCHESTRATOR ----------
 def run_agent(history: list, chat_id: int) -> dict:
-    deadline = time.time() + 210
     convo_log = []
     response_text = None
     provider_used = "gemini"
 
-    try:
-        response_text = run_gemini_agent(history, chat_id, deadline, convo_log)
-    except Exception as e:
-        log_step(chat_id, convo_log, {"event": "gemini_exception", "error": str(e), "trace": traceback.format_exc()})
-        response_text = None
+    if gemini_quota_available():
+        response_text = run_gemini_agent(history, chat_id, convo_log)
+    else:
+        convo_log.append({"event": "gemini_quota_exhausted_skipping"})
 
     if response_text is None or extract_json(response_text) is None:
-        log_step(chat_id, convo_log, {"event": "falling_back_to_groq"})
+        convo_log.append({"event": "falling_back_to_groq"})
         provider_used = "groq"
-        try:
-            response_text = run_groq_agent(history, chat_id, deadline, convo_log)
-        except Exception as e:
-            log_step(chat_id, convo_log, {"event": "groq_exception", "error": str(e), "trace": traceback.format_exc()})
-            response_text = None
+        response_text = run_groq_agent(history, chat_id, convo_log)
+
+    for entry in convo_log:
+        log_event({"chat_id": chat_id, **entry})
 
     parsed = extract_json(response_text) if response_text else None
-    parsed = normalize_final(parsed)
-    parsed["log_url"] = f"{BASE_URL}/run.jsonl"
 
+    if parsed is None:
+        parsed = {"answer": "internal error", "log_url": "LOG_URL_PLACEHOLDER"}
+    elif "answer" not in parsed:
+        parsed = {"answer": parsed, "log_url": "LOG_URL_PLACEHOLDER"}
+
+    parsed["log_url"] = f"{BASE_URL}/run.jsonl"
     log_event({"chat_id": chat_id, "event": "provider_used", "provider": provider_used})
     return parsed
 
+
 # ---------- TELEGRAM POLLING ----------
 chat_histories = defaultdict(list)
-history_lock = threading.Lock()
 MAX_HISTORY = 20
+
 
 def telegram_send(chat_id, text):
     try:
@@ -403,28 +357,30 @@ def telegram_send(chat_id, text):
     except Exception as e:
         log_event({"chat_id": chat_id, "event": "telegram_send_failed", "error": str(e)})
 
-def handle_message(chat_id, text, received_at):
-    log_event({"chat_id": chat_id, "event": "handler_started", "queue_delay_sec": round(time.time() - received_at, 3)})
 
-    with history_lock:
-        chat_histories[chat_id].append({"role": "user", "parts": [text]})
-        chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
-        history_snapshot = list(chat_histories[chat_id])
+def handle_message(chat_id, text):
+    chat_histories[chat_id].append({"role": "user", "parts": [text]})
+    chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
 
     try:
-        result = run_agent(history_snapshot, chat_id)
+        result = run_agent(chat_histories[chat_id], chat_id)
     except Exception as e:
         log_event({"chat_id": chat_id, "event": "top_level_exception", "error": str(e), "trace": traceback.format_exc()})
         result = {"answer": "internal error", "log_url": f"{BASE_URL}/run.jsonl"}
 
     reply_text = json.dumps(result)
-
-    with history_lock:
-        chat_histories[chat_id].append({"role": "model", "parts": [reply_text]})
-        chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY:]
+    chat_histories[chat_id].append({"role": "model", "parts": [reply_text]})
 
     telegram_send(chat_id, reply_text)
     log_event({"chat_id": chat_id, "event": "reply_sent", "reply": result})
+
+
+# Dedup guard: prevents double-replies if two instances/pollers ever
+# end up hitting getUpdates before the offset commits (this is what
+# caused the earlier duplicate/incorrect-answer incident).
+processed_updates = set()
+processed_lock = threading.Lock()
+
 
 def polling_loop():
     offset = None
@@ -437,16 +393,24 @@ def polling_loop():
             data = resp.json()
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
+                uid = update["update_id"]
+                with processed_lock:
+                    if uid in processed_updates:
+                        continue
+                    processed_updates.add(uid)
+                    if len(processed_updates) > 5000:
+                        processed_updates.clear()
                 message = update.get("message")
                 if not message:
                     continue
                 chat_id = message["chat"]["id"]
                 text = message.get("text", "")
                 if text:
-                    message_executor.submit(handle_message, chat_id, text, time.time())
+                    threading.Thread(target=handle_message, args=(chat_id, text)).start()
         except Exception as e:
             log_event({"event": "polling_error", "error": str(e)})
             time.sleep(5)
+
 
 def self_ping_loop():
     while True:
@@ -456,12 +420,15 @@ def self_ping_loop():
         except Exception:
             pass
 
+
 # ---------- FASTAPI APP ----------
 app = FastAPI()
+
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
+
 
 @app.get("/run.jsonl")
 def get_log():
@@ -470,6 +437,7 @@ def get_log():
     with open(LOG_FILE, "r", encoding="utf-8") as f:
         content = f.read()
     return PlainTextResponse(content, media_type="text/plain")
+
 
 @app.on_event("startup")
 def startup():
