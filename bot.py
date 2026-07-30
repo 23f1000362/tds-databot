@@ -337,9 +337,16 @@ def run_agent(history: list, chat_id: int) -> dict:
     parsed = extract_json(response_text) if response_text else None
 
     if parsed is None:
-        parsed = {"answer": "internal error", "log_url": "LOG_URL_PLACEHOLDER"}
+        parsed = {"answer": "internal error"}
     elif "answer" not in parsed:
-        parsed = {"answer": parsed, "log_url": "LOG_URL_PLACEHOLDER"}
+        other_keys = [k for k in parsed.keys() if k != "log_url"]
+        if len(other_keys) == 1:
+            parsed = {"answer": parsed[other_keys[0]]}
+        else:
+            parsed = {"answer": {k: v for k, v in parsed.items() if k != "log_url"}}
+
+    if isinstance(parsed.get("answer"), dict) and "log_url" in parsed["answer"]:
+        parsed["answer"] = {k: v for k, v in parsed["answer"].items() if k != "log_url"}
 
     parsed["log_url"] = f"{BASE_URL}/run.jsonl"
     log_event({"chat_id": chat_id, "event": "provider_used", "provider": provider_used})
