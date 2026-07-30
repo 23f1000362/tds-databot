@@ -3,7 +3,6 @@ import json
 import time
 import threading
 import traceback
-import signal
 from datetime import datetime, timezone
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -21,10 +20,17 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 BASE_URL = os.environ["BASE_URL"]
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# FIX: added http_options timeout (ms) so a hung Gemini call can't block
+# the whole handler forever - it now raises after 45s so retry logic
+# in gemini_generate() actually gets a chance to run.
+client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(timeout=45_000),
+)
 GEMINI_MODEL = "gemini-flash-lite-latest"
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+# FIX: added client-level timeout (seconds) for the same reason on Groq's side.
+groq_client = Groq(api_key=GROQ_API_KEY, timeout=45.0)
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -38,14 +44,23 @@ def log_event(event: dict):
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
 
+# FIX: convo_log entries used to only get written to disk after the whole
+# agent loop returned, so a hang mid-loop produced total silence in the
+# log. This helper writes to disk immediately, at the moment each step
+# happens, so you can see exactly where execution is stuck in real time.
+def log_step(chat_id, convo_log, entry):
+    convo_log.append(entry)
+    log_event({"chat_id": chat_id, **entry})
+
 # ---------- CONCURRENCY CONTROL ----------
 # Bounded pool for handling messages. Caps how many "agent runs" can be
-# in flight at once instead of spawning an unbounded number of raw threads.
+# in flight at once instead of spawning an unbounded number of raw threads,
+# which was causing contention/slowness under any concurrent load.
 MESSAGE_WORKERS = 4
 message_executor = ThreadPoolExecutor(max_workers=MESSAGE_WORKERS, thread_name_prefix="msg")
 
-# Separate small pool just for run_python's timeout-guarded execution.
-# Bounded so a burst of tool calls can't create unbounded native threads either.
+# Separate bounded pool for run_python's timeout-guarded execution, so a
+# burst of tool calls can't spawn unbounded native threads either.
 TOOL_WORKERS = 8
 tool_executor = ThreadPoolExecutor(max_workers=TOOL_WORKERS, thread_name_prefix="tool")
 
@@ -67,12 +82,10 @@ def run_python(code: str, timeout: float = 60) -> str:
     try:
         output = future.result(timeout=timeout)
     except Exception:
-        # Covers both TimeoutError and any executor-level failure.
-        # Note: the underlying thread is NOT killed (Python has no safe way
-        # to kill a thread) - it keeps running in the background and its
-        # result is discarded. This matches the original behavior but is
-        # worth knowing: a hung exec() leaks a thread until it finishes on
-        # its own or the process restarts.
+        # Covers both TimeoutError and any executor-level failure. Note:
+        # the underlying thread is NOT killed (Python has no safe way to
+        # kill a thread) - it keeps running in the background and its
+        # result is discarded once it eventually finishes.
         return f"ERROR: code execution timed out after {timeout:.0f} seconds (likely a hanging network call or infinite loop)."
 
     return output[-8000:]
@@ -212,24 +225,15 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
     step = 0
     response_text = None
 
+    log_step(chat_id, convo_log, {"event": "gemini_calling", "step": 0})
     response = gemini_generate(contents)
+    log_step(chat_id, convo_log, {"event": "gemini_first_response_received", "step": 0})
 
-    # BUG FIX: the original checked `time.time() > deadline` at the TOP of
-    # the loop, BEFORE looking at the response that was just fetched. Since
-    # step 1's response is fetched *before* the loop even starts, and the
-    # deadline check for "step 2" ran essentially instantly afterward, a
-    # deadline that's already stale (or a slow first call) causes the
-    # very next step to immediately declare "deadline exceeded" even
-    # though a perfectly good response was sitting right there unused.
-    # This is exactly what happened in your log: it got a valid function
-    # response, then discarded it because of a deadline check with no
-    # real work in between. Fix: check the deadline based on what's left
-    # of the budget, and don't let a fast, valid response get thrown away.
     while step < max_steps:
         step += 1
 
         if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
-            convo_log.append({
+            log_step(chat_id, convo_log, {
                 "event": "gemini_empty_response",
                 "step": step,
                 "finish_reason": str(getattr(response.candidates[0], "finish_reason", None)) if response.candidates else "no_candidates"
@@ -244,13 +248,13 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
         if func_calls:
             fc = func_calls[0]
             code = fc.args.get("code", "")
-            convo_log.append({"event": "gemini_tool_call", "step": step, "code": code})
+            log_step(chat_id, convo_log, {"event": "gemini_tool_call", "step": step, "code": code})
 
             remaining = deadline - time.time()
             if remaining <= 5:
                 # Not enough budget left to run a tool call and still get
                 # a final answer back. Stop looping and force a final answer.
-                convo_log.append({"event": "gemini_deadline_exceeded", "step": step})
+                log_step(chat_id, convo_log, {"event": "gemini_deadline_exceeded", "step": step})
                 contents.append(candidate.content)
                 contents.append(types.Content(
                     role="user",
@@ -262,7 +266,7 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
 
             call_timeout = min(60, remaining)
             result = run_python(code, timeout=call_timeout)
-            convo_log.append({"event": "gemini_tool_result", "step": step, "output": result})
+            log_step(chat_id, convo_log, {"event": "gemini_tool_result", "step": step, "output": result})
 
             contents.append(candidate.content)
             contents.append(types.Content(
@@ -273,7 +277,7 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
             ))
 
             if time.time() > deadline:
-                convo_log.append({"event": "gemini_deadline_exceeded", "step": step})
+                log_step(chat_id, convo_log, {"event": "gemini_deadline_exceeded", "step": step})
                 contents.append(types.Content(
                     role="user",
                     parts=[types.Part(text="Time is up. Answer NOW with only the final JSON object, no tools.")]
@@ -282,14 +286,16 @@ def run_gemini_agent(history: list, chat_id: int, deadline: float, convo_log: li
                 response_text = safe_text(response)
                 break
 
+            log_step(chat_id, convo_log, {"event": "gemini_calling", "step": step})
             response = gemini_generate(contents)
+            log_step(chat_id, convo_log, {"event": "gemini_response_received", "step": step})
         else:
             response_text = safe_text(response)
-            convo_log.append({"event": "gemini_final_text", "step": step, "text": response_text})
+            log_step(chat_id, convo_log, {"event": "gemini_final_text", "step": step, "text": response_text})
             break
 
     if response_text is None and step >= max_steps:
-        convo_log.append({"event": "gemini_max_steps_exceeded", "step": step})
+        log_step(chat_id, convo_log, {"event": "gemini_max_steps_exceeded", "step": step})
         contents.append(types.Content(
             role="user",
             parts=[types.Part(text="You have used too many steps. Stop trying new approaches and answer NOW with only the final JSON object, using your best available information.")]
@@ -316,7 +322,7 @@ def run_groq_agent(history: list, chat_id: int, deadline: float, convo_log: list
     while step < max_steps:
         step += 1
         if time.time() > deadline:
-            convo_log.append({"event": "groq_deadline_exceeded", "step": step})
+            log_step(chat_id, convo_log, {"event": "groq_deadline_exceeded", "step": step})
             messages.append({"role": "user", "content": "Time is up. Answer NOW with only the final JSON object, no tools."})
             resp = groq_client.chat.completions.create(
                 model=GROQ_MODEL, messages=messages,
@@ -324,6 +330,7 @@ def run_groq_agent(history: list, chat_id: int, deadline: float, convo_log: list
             response_text = resp.choices[0].message.content
             break
 
+        log_step(chat_id, convo_log, {"event": "groq_calling", "step": step})
         resp = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
@@ -344,11 +351,11 @@ def run_groq_agent(history: list, chat_id: int, deadline: float, convo_log: list
                 except Exception:
                     args = {}
                 code = args.get("code", "")
-                convo_log.append({"event": "groq_tool_call", "step": step, "code": code})
+                log_step(chat_id, convo_log, {"event": "groq_tool_call", "step": step, "code": code})
                 remaining = max(5, deadline - time.time())
                 call_timeout = min(60, remaining)
                 result = run_python(code, timeout=call_timeout)
-                convo_log.append({"event": "groq_tool_result", "step": step, "output": result})
+                log_step(chat_id, convo_log, {"event": "groq_tool_result", "step": step, "output": result})
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -356,11 +363,11 @@ def run_groq_agent(history: list, chat_id: int, deadline: float, convo_log: list
                 })
         else:
             response_text = msg.content
-            convo_log.append({"event": "groq_final_text", "step": step, "text": response_text})
+            log_step(chat_id, convo_log, {"event": "groq_final_text", "step": step, "text": response_text})
             break
 
     if response_text is None:
-        convo_log.append({"event": "groq_max_steps_exceeded", "step": step})
+        log_step(chat_id, convo_log, {"event": "groq_max_steps_exceeded", "step": step})
         messages.append({"role": "user", "content": "Stop trying new approaches and answer NOW with only the final JSON object, using your best available information."})
         resp = groq_client.chat.completions.create(model=GROQ_MODEL, messages=messages)
         response_text = resp.choices[0].message.content
@@ -377,20 +384,22 @@ def run_agent(history: list, chat_id: int) -> dict:
     try:
         response_text = run_gemini_agent(history, chat_id, deadline, convo_log)
     except Exception as e:
-        convo_log.append({"event": "gemini_exception", "error": str(e), "trace": traceback.format_exc()})
+        log_step(chat_id, convo_log, {"event": "gemini_exception", "error": str(e), "trace": traceback.format_exc()})
         response_text = None
 
     if response_text is None or extract_json(response_text) is None:
-        convo_log.append({"event": "falling_back_to_groq"})
+        log_step(chat_id, convo_log, {"event": "falling_back_to_groq"})
         provider_used = "groq"
         try:
             response_text = run_groq_agent(history, chat_id, deadline, convo_log)
         except Exception as e:
-            convo_log.append({"event": "groq_exception", "error": str(e), "trace": traceback.format_exc()})
+            log_step(chat_id, convo_log, {"event": "groq_exception", "error": str(e), "trace": traceback.format_exc()})
             response_text = None
 
-    for entry in convo_log:
-        log_event({"chat_id": chat_id, **entry})
+    # NOTE: convo_log entries are now written to disk as they happen (via
+    # log_step), so no batch-write loop is needed here anymore. convo_log
+    # itself is kept only for now in case future code wants the in-memory
+    # list, but nothing further needs to be flushed to run.jsonl.
 
     parsed = extract_json(response_text) if response_text else None
     parsed = normalize_final(parsed)
@@ -401,11 +410,7 @@ def run_agent(history: list, chat_id: int) -> dict:
 
 # ---------- TELEGRAM POLLING ----------
 chat_histories = defaultdict(list)
-history_lock = threading.Lock()  # BUG FIX: chat_histories is mutated from
-                                  # multiple worker threads concurrently;
-                                  # defaultdict/list mutation isn't atomic
-                                  # across the read-modify-write sequences
-                                  # used below, so guard it.
+history_lock = threading.Lock()  # guards concurrent read-modify-write on chat_histories
 MAX_HISTORY = 20
 
 def telegram_send(chat_id, text):
@@ -454,10 +459,6 @@ def polling_loop():
                 chat_id = message["chat"]["id"]
                 text = message.get("text", "")
                 if text:
-                    # BUG FIX: was `threading.Thread(...).start()` per message
-                    # with no cap. Now goes through a bounded pool so bursts
-                    # of messages queue instead of spawning unbounded threads
-                    # that starve each other for GIL/network time.
                     message_executor.submit(handle_message, chat_id, text, time.time())
         except Exception as e:
             log_event({"event": "polling_error", "error": str(e)})
